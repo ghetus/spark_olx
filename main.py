@@ -15,7 +15,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "Proiectoare OLX")
 
-# Căutare directă ordonată după cele mai noi anunțuri
 OLX_SEARCH_URL = "https://www.olx.ro/d/electronice-electrocasnice/tv-audio-video/videoproiectoare/?search%5Border%5D=created_at%3Adesc"
 
 # ---------------------------------------------------------------------------
@@ -47,13 +46,11 @@ Trebuie să returnezi UNICEMENTE un obiect JSON cu această structură:
 """
 
 def init_gemini():
-    """Inițializează clientul Gemini."""
     if not GEMINI_API_KEY:
         raise ValueError("Lipsește variabila de mediu GEMINI_API_KEY!")
     return genai.Client(api_key=GEMINI_API_KEY)
 
 def init_google_sheets():
-    """Autentificare în Google Sheets folosind contul de serviciu."""
     if not GOOGLE_CREDENTIALS_JSON:
         raise ValueError("Lipsește variabila de mediu GOOGLE_CREDENTIALS_JSON!")
     
@@ -79,7 +76,6 @@ def init_google_sheets():
     return worksheet
 
 def get_already_inserted_links(worksheet):
-    """Obține lista de link-uri deja procesate pentru a evita duplicatele."""
     try:
         col_links = worksheet.col_values(8)
         return set(col_links[1:])
@@ -87,17 +83,13 @@ def get_already_inserted_links(worksheet):
         print(f"Avertisment la citirea linkurilor existente: {e}")
         return set()
 
-def fetch_olx_ads():
-    """Preluare anunțuri folosind curl_cffi cu amprentă completă de Chrome."""
-    session = requests.Session(impersonate="chrome124")
-    
-    # 1. Încărcare primară pentru stabilire sesiune
-    session.get("https://www.olx.ro")
-    time.sleep(1)
-    
-    # 2. Cerere către pagina de categorie
+def fetch_olx_ads(session):
+    print("Se accesează OLX cu impersonare Chrome...")
     response = session.get(OLX_SEARCH_URL)
-    response.raise_for_status()
+    
+    if response.status_code != 200:
+        print(f"Eroare la accesare OLX: Status Code {response.status_code}")
+        return []
     
     soup = BeautifulSoup(response.text, "html.parser")
     cards = soup.find_all("div", {"data-testid": "l-card"})
@@ -125,7 +117,6 @@ def fetch_olx_ads():
     return ads
 
 def fetch_ad_description(session, ad_url):
-    """Preluare descriere anunț individual."""
     try:
         res = session.get(ad_url)
         if res.status_code == 200:
@@ -138,7 +129,6 @@ def fetch_ad_description(session, ad_url):
     return ""
 
 def analyze_ad_with_gemini(client, title, price, description):
-    """Analiză anunț prin Gemini API."""
     prompt = f"""
     Titlu Anunț: {title}
     Preț solicitat: {price}
@@ -168,8 +158,9 @@ def main():
     worksheet = init_google_sheets()
     inserted_links = get_already_inserted_links(worksheet)
     
+    # Folosim impersonate="chrome124" pentru a ocoli blocajul TLS/Cloudflare
     session = requests.Session(impersonate="chrome124")
-    ads = fetch_olx_ads()
+    ads = fetch_olx_ads(session)
     print(f"S-au găsit {len(ads)} anunțuri pe OLX.")
     
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
