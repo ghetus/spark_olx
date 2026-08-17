@@ -3,7 +3,6 @@ import json
 import time
 from datetime import datetime
 from curl_cffi import requests
-from bs4 import BeautifulSoup
 import gspread
 from google import genai
 from google.genai import types
@@ -15,7 +14,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "Proiectoare OLX")
 
-OLX_SEARCH_URL = "https://www.olx.ro/oferte/q-videoproiector/?search%5Border%5D=created_at%3Adesc"
+# Folosim API-ul intern OLX - mult mai rapid și imun la modificările de design web
+OLX_API_URL = "https://www.olx.ro/api/v1/offers/?query=videoproiector&sort_by=created_at:desc&limit=40"
 
 SYSTEM_INSTRUCTION = """
 Ești un expert tehnic în echipamente video și videoproiectoare. 
@@ -23,21 +23,21 @@ Analizează titlul și descrierea dintr-un anunț OLX și stabilește dacă proi
 
 CRITERII TEHNICE:
 1. Luminozitate: minim 3000 ANSI Lumens.
-2. Rezoluție nativă: minim 1280x800 (WXGA). Nu accepta rezoluții inferioare.
+2. Rezoluție nativă: minim 1280x800 (WXGA). Nu accepta rezoluții inferioare (ex: 800x600).
 3. Raport aspect nativ: 16:9 sau 16:10.
 4. An fabricație / Lansare model: aproximativ 2020 sau mai nou.
 5. Conectivitate: Port HDMI prezent.
 6. Stare: În stare funcțională.
 
-Dacă specificațiile nu sunt menționate detaliat în anunț, verifică modelul conform fișei oficiale a producătorului.
+Dacă specificațiile nu sunt menționate detaliat, folosește-ți cunoștințele tehnice pentru a identifica fișa oficială a modelului.
 
 Răspunde DOAR în format JSON valid cu următoarea structură:
 {
   "eligible": true/false,
-  "reject_reason": "Motivul respingerii",
+  "reject_reason": "Motivul respingerii (dacă nu e eligibil)",
   "brand_model": "Brand și Model",
   "specs": "Rezoluție | Lumeni | Aspect | An",
-  "quality_score": "X/10 - Motivare scurtă",
+  "quality_score": "X/10 - Motivare scurtă preț/performanță",
   "summary": "Scurt rezumat despre stare"
 }
 """
@@ -56,73 +56,50 @@ def init_google_sheets():
     sh = gc.open(SPREADSHEET_NAME)
     worksheet = sh.sheet1
     
-    existing_headers = worksheet.row_values(1)
-    expected_headers = [
-        "Data Inserării", 
-        "Titlu Anunț", 
-        "Brand & Model", 
-        "Detalii Tehnice", 
-        "Preț", 
-        "Nota Calitate/Preț", 
-        "Sumar / Stare", 
-        "Link Anunț"
-    ]
-    if not existing_headers:
-        worksheet.append_row(expected_headers)
-        
+    if not worksheet.row_values(1):
+        worksheet.append_row([
+            "Data Inserării", "Titlu Anunț", "Brand & Model", 
+            "Detalii Tehnice", "Preț", "Nota Calitate/Preț", 
+            "Sumar / Stare", "Link Anunț"
+        ])
     return worksheet
 
-def get_already_inserted_links(worksheet):
-    try:
-        col_links = worksheet.col_values(8)
-        return set(col_links[1:])
-    except Exception as e:
-        return set()
-
-def fetch_olx_ads(session):
-    print("Se accesează OLX (simulare Chrome)...")
-    response = session.get(OLX_SEARCH_URL)
+def fetch_olx_ads_api(session):
+    print("Se extrag datele prin API-ul intern OLX...")
+    response = session.get(OLX_API_URL)
     
     if response.status_code != 200:
-        print(f"Eroare la accesare OLX: Status {response.status_code}")
+        print(f"Eroare la accesare API: Status {response.status_code}")
         return []
-    
-    soup = BeautifulSoup(response.text, "html.parser")
-    cards = soup.find_all("div", {"data-testid": "l-card"})
-    
-    ads = []
-    for card in cards:
-        title_elem = card.find("h6")
-        link_elem = card.find("a")
-        price_elem = card.find("p", {"data-testid": "ad-price"})
         
-        if not title_elem or not link_elem:
-            continue
-            
-        title = title_elem.get_text(strip=True)
-        raw_href = link_elem.get("href", "")
-        link = raw_href if raw_href.startswith("http") else f"https://www.olx.ro{raw_href}"
-        price = price_elem.get_text(strip=True) if price_elem else "Nespecificat"
+    data = response.json()
+    offers = data.get("data", [])
+    ads = []
+    
+    for offer in offers:
+        title = offer.get("title", "")
+        url = offer.get("url", "")
+        
+        # Extragere preț din structura JSON
+        price_str = "Nespecificat"
+        for param in offer.get("params", []):
+            if param.get("key") == "price":
+                val = param.get("value", {})
+                price_str = f"{val.get('value', '')} {val.get('currency', 'RON')}"
+                break
+                
+        # API-ul ne dă direct și descrierea! Curățăm tag-urile de HTML.
+        raw_desc = offer.get("description", "")
+        clean_desc = raw_desc.replace("<br />", "\n").replace("<br/>", "\n").replace("<p>", "").replace("</p>", "\n")
         
         ads.append({
             "title": title,
-            "link": link,
-            "price": price
+            "link": url,
+            "price": price_str,
+            "description": clean_desc
         })
         
     return ads
-
-def fetch_ad_description(session, ad_url):
-    try:
-        res = session.get(ad_url)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            desc_div = soup.find("div", {"data-cy": "ad_description"})
-            if desc_div:
-                return desc_div.get_text(separator="\n", strip=True)
-    except Exception:
-        pass
-    return ""
 
 def analyze_ad_with_gemini(client, title, price, description):
     prompt = f"Titlu: {title}\nPreț: {price}\nDescriere:\n{description}"
@@ -142,16 +119,20 @@ def analyze_ad_with_gemini(client, title, price, description):
         return None
 
 def main():
-    print("Pornire verificare anunțuri noi...")
+    print("Pornire verificare anunțuri noi (API Mode)...")
     
     gemini_client = init_gemini()
     worksheet = init_google_sheets()
-    inserted_links = get_already_inserted_links(worksheet)
     
-    # Folosim impersonate pentru a ocoli filtrul anti-bot
+    # Preluăm linkurile deja procesate
+    try:
+        inserted_links = set(worksheet.col_values(8)[1:])
+    except Exception:
+        inserted_links = set()
+    
     session = requests.Session(impersonate="chrome124")
-    ads = fetch_olx_ads(session)
-    print(f"S-au extras {len(ads)} anunțuri recente.")
+    ads = fetch_olx_ads_api(session)
+    print(f"S-au găsit {len(ads)} anunțuri recente pe OLX.")
     
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     inserted_count = 0
@@ -161,21 +142,20 @@ def main():
             continue
             
         print(f"\nAnalizare: {ad['title']} ({ad['price']})")
-        description = fetch_ad_description(session, ad["link"])
         
         analysis = analyze_ad_with_gemini(
             client=gemini_client,
             title=ad["title"],
             price=ad["price"],
-            description=description
+            description=ad["description"]
         )
         
         if not analysis:
             continue
             
         if analysis.get("eligible") is True:
-            print(" -> ACCEPTAT! Se salvează în tabel...")
-            row = [
+            print(" -> ACCEPTAT! Se salvează în Google Sheet...")
+            worksheet.append_row([
                 today_str,
                 ad["title"],
                 analysis.get("brand_model", "N/A"),
@@ -184,15 +164,14 @@ def main():
                 analysis.get("quality_score", "N/A"),
                 analysis.get("summary", "N/A"),
                 ad["link"]
-            ]
-            worksheet.append_row(row)
+            ])
             inserted_links.add(ad["link"])
             inserted_count += 1
         else:
             reason = analysis.get("reject_reason", "Neeligibil")
             print(f" -> Respins: {reason}")
             
-        time.sleep(1)
+        time.sleep(1) # Pauză pentru a nu copleși API-ul Gemini
 
     print(f"\nFinalizat! Au fost adăugate {inserted_count} anunțuri noi conforme.")
 
