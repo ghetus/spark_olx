@@ -1,9 +1,8 @@
 import os
 import json
-import re
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 import requests
-from bs4 import BeautifulSoup
 import gspread
 from google import genai
 from google.genai import types
@@ -15,23 +14,23 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "Proiectoare OLX")
 
-# URL-ul de căutare pe OLX (ordonați după cele mai recente)
-OLX_SEARCH_URL = "https://www.olx.ro/d/electronice-electrocasnice/tv-audio-video/videoproiectoare/?search%5Border%5D=created_at%3Adesc"
+# Endpoint-ul API intern OLX (mult mai stabil și greu de blocat decât parsarea HTML)
+OLX_API_URL = "https://www.olx.ro/api/v1/offers/?category_id=745&sort_by=created_at:desc&limit=40"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.olx.ro/d/electronice-electrocasnice/tv-audio-video/videoproiectoare/",
+    "Origin": "https://www.olx.ro"
 }
 
 # ---------------------------------------------------------------------------
-# PROMPT GEMINI (Pentu filtrare & calculat scor)
+# PROMPT GEMINI (Pentru filtrare & calculat scor)
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = """
 Ești un expert tehnic în echipamente video și videoproiectoare. 
-Analizează titlul și descrierea furnizate din anunțul OLX pentru a determina dacă videoproiectorul respectă STRICT criteriile următoare:
+Analizează titlul, parametrii și descrierea furnizate din anunțul OLX pentru a determina dacă videoproiectorul respectă STRICT criteriile următoare:
 
 CRITERII TEHNICE OBLIGATORII:
 1. Luminozitate: minim 3000 ANSI Lumens (sau echivalent de producție verificat pentru modelul respectiv).
@@ -41,7 +40,7 @@ CRITERII TEHNICE OBLIGATORII:
 5. Conectivitate: Port HDMI prezent.
 6. Stare: În stare perfectă/bună de funcționare (fără lămpi arse, pete pe imagine sau defecte majore).
 
-Dacă specificațiile tehnice complete nu sunt scrise explicit în anunț, folosește-ți cunoștințele tehnice despre modelul identificat în titlu/text pentru a verifica specificațiile reale ale producătorului.
+Dacă specificațiile tehnice complete nu sunt scrise explicit în descriere, folosește-ți cunoștințele tehnice despre modelul identificat pentru a verifica fișa tehnică a producătorului.
 
 Trebuie să returnezi UNICEMENTE un obiect JSON cu această structură:
 {
@@ -55,24 +54,21 @@ Trebuie să returnezi UNICEMENTE un obiect JSON cu această structură:
 """
 
 def init_gemini():
-    """Inițializează clientul Gemini folosind noul SDK `google-genai`."""
+    """Inițializează clientul Gemini."""
     if not GEMINI_API_KEY:
-        raise ValueError("Lipseste variabila de mediu GEMINI_API_KEY!")
+        raise ValueError("Lipsește variabila de mediu GEMINI_API_KEY!")
     return genai.Client(api_key=GEMINI_API_KEY)
 
 def init_google_sheets():
-    """Autentificare în Google Sheets folosind contul de serviciu (Service Account)."""
+    """Autentificare în Google Sheets folosind contul de serviciu."""
     if not GOOGLE_CREDENTIALS_JSON:
-        raise ValueError("Lipseste variabila de mediu GOOGLE_CREDENTIALS_JSON!")
+        raise ValueError("Lipsește variabila de mediu GOOGLE_CREDENTIALS_JSON!")
     
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     gc = gspread.service_account_from_dict(creds_dict)
-    
-    # Deschide spreadsheet-ul și primul worksheet
     sh = gc.open(SPREADSHEET_NAME)
     worksheet = sh.sheet1
     
-    # Verifică/Creează antetul dacă tabelul este gol
     existing_headers = worksheet.row_values(1)
     expected_headers = [
         "Data Inserării", 
@@ -92,66 +88,62 @@ def init_google_sheets():
 def get_already_inserted_links(worksheet):
     """Obține lista de link-uri deja procesate pentru a evita duplicatele."""
     try:
-        col_links = worksheet.col_values(8)  # Coloana H este Link Anunț
-        return set(col_links[1:])  # Fără antet
+        col_links = worksheet.col_values(8)
+        return set(col_links[1:])
     except Exception as e:
         print(f"Avertisment la citirea linkurilor existente: {e}")
         return set()
 
 def fetch_olx_ads():
-    """Extrage lista de anunțuri recente de pe prima pagină OLX."""
-    response = requests.get(OLX_SEARCH_URL, headers=HEADERS, timeout=15)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    """Preluare anunțuri prin API-ul intern JSON OLX."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
     
-    cards = soup.find_all("div", {"data-testid": "l-card"})
+    # Efectuăm o cerere către homepage pentru a prelua cookie-urile de sesiune
+    try:
+        session.get("https://www.olx.ro", timeout=10)
+    except Exception:
+        pass
+    
+    response = session.get(OLX_API_URL, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    
+    offers = data.get("data", [])
     ads = []
     
-    for card in cards:
-        # Preluare Titlu și Link
-        title_elem = card.find("h6")
-        link_elem = card.find("a")
-        price_elem = card.find("p", {"data-testid": "ad-price"})
+    for offer in offers:
+        title = offer.get("title", "")
+        url = offer.get("url", "")
         
-        if not title_elem or not link_elem:
-            continue
-            
-        title = title_elem.get_text(strip=True)
-        raw_href = link_elem.get("href", "")
-        link = raw_href if raw_href.startswith("http") else f"https://www.olx.ro{raw_href}"
-        
-        price = price_elem.get_text(strip=True) if price_elem else "Nespecificat"
+        # Formatare preț
+        params = offer.get("params", [])
+        price_str = "Nespecificat"
+        for p in params:
+            if p.get("key") == "price":
+                val = p.get("value", {})
+                price_str = f"{val.get('value', '')} {val.get('currency', 'RON')}"
+                break
+                
+        desc = offer.get("description", "")
+        # Eliminare tag-uri html simple din descriere
+        desc_clean = desc.replace("<br />", "\n").replace("<br/>", "\n").replace("<p>", "").replace("</p>", "\n")
         
         ads.append({
             "title": title,
-            "link": link,
-            "price": price
+            "link": url,
+            "price": price_str,
+            "description": desc_clean
         })
         
     return ads
 
-def fetch_ad_details(ad_url):
-    """Extrage textul detaliat al descrierii unui anunț."""
-    try:
-        res = requests.get(ad_url, headers=HEADERS, timeout=10)
-        if res.status_code != 200:
-            return ""
-        soup = BeautifulSoup(res.text, "html.parser")
-        
-        # OLX folosește div-uri de clasa "css-1m82329" sau data-description
-        desc_div = soup.find("div", {"data-cy": "ad_description"}) or soup.find("div", class_=re.compile("description"))
-        if desc_div:
-            return desc_div.get_text(separator="\n", strip=True)
-    except Exception as e:
-        print(f"Eroare la preluarea descrierii pentru {ad_url}: {e}")
-    return ""
-
 def analyze_ad_with_gemini(client, title, price, description):
-    """Analizează anunțul cu Gemini API folosind Structured JSON Output."""
+    """Analizează anunțul cu Gemini API folosind JSON structurat."""
     prompt = f"""
     Titlu Anunț: {title}
     Preț solicitat: {price}
-    Descriere completă din anunț:
+    Descriere din anunț:
     {description}
     """
     
@@ -165,8 +157,7 @@ def analyze_ad_with_gemini(client, title, price, description):
                 temperature=0.2,
             ),
         )
-        data = json.loads(response.text)
-        return data
+        return json.loads(response.text)
     except Exception as e:
         print(f"Eroare la analiza Gemini: {e}")
         return None
@@ -179,24 +170,21 @@ def main():
     inserted_links = get_already_inserted_links(worksheet)
     
     ads = fetch_olx_ads()
-    print(f"S-au găsit {len(ads)} anunțuri pe prima pagină OLX.")
+    print(f"S-au recepționat {len(ads)} anunțuri de pe OLX.")
     
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     inserted_count = 0
     
     for ad in ads:
         if ad["link"] in inserted_links:
-            print(f"Sărit (deja salvat): {ad['title']}")
             continue
             
-        print(f"\nProcesare: {ad['title']} ({ad['price']})")
-        description = fetch_ad_details(ad["link"])
-        
+        print(f"\nAnalizare: {ad['title']} ({ad['price']})")
         analysis = analyze_ad_with_gemini(
             client=gemini_client,
             title=ad["title"],
             price=ad["price"],
-            description=description
+            description=ad["description"]
         )
         
         if not analysis:
@@ -220,8 +208,10 @@ def main():
         else:
             reason = analysis.get("reject_reason", "Neeligibil")
             print(f" -> Respins: {reason}")
+            
+        time.sleep(1)  # Pauză scurtă între interogări
 
-    print(f"\nFinalizat! S-au inserat {inserted_count} anunțuri noi eligibile.")
+    print(f"\nFinalizat cu succes! S-au adăugat {inserted_count} anunțuri noi eligibile.")
 
 if __name__ == "__main__":
     main()
