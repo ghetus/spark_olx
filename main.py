@@ -2,7 +2,8 @@ import os
 import json
 import time
 from datetime import datetime
-import requests
+from curl_cffi import requests
+from bs4 import BeautifulSoup
 import gspread
 from google import genai
 from google.genai import types
@@ -14,33 +15,25 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "Proiectoare OLX")
 
-# Endpoint-ul API intern OLX (mult mai stabil și greu de blocat decât parsarea HTML)
-OLX_API_URL = "https://www.olx.ro/api/v1/offers/?category_id=745&sort_by=created_at:desc&limit=40"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.olx.ro/d/electronice-electrocasnice/tv-audio-video/videoproiectoare/",
-    "Origin": "https://www.olx.ro"
-}
+# Căutare directă ordonată după cele mai noi anunțuri
+OLX_SEARCH_URL = "https://www.olx.ro/d/electronice-electrocasnice/tv-audio-video/videoproiectoare/?search%5Border%5D=created_at%3Adesc"
 
 # ---------------------------------------------------------------------------
-# PROMPT GEMINI (Pentru filtrare & calculat scor)
+# PROMPT GEMINI
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = """
 Ești un expert tehnic în echipamente video și videoproiectoare. 
 Analizează titlul, parametrii și descrierea furnizate din anunțul OLX pentru a determina dacă videoproiectorul respectă STRICT criteriile următoare:
 
 CRITERII TEHNICE OBLIGATORII:
-1. Luminozitate: minim 3000 ANSI Lumens (sau echivalent de producție verificat pentru modelul respectiv).
+1. Luminozitate: minim 3000 ANSI Lumens (sau echivalent verificat al modelului).
 2. Rezoluție nativă: minim 1280x800 (WXGA, HD+, Full HD 1080p, 2K, 4K).
 3. Raport aspect nativ: 16:9 sau 16:10 (nu 4:3).
 4. An fabricație / Lansare model: aproximativ 2020 sau mai nou.
 5. Conectivitate: Port HDMI prezent.
 6. Stare: În stare perfectă/bună de funcționare (fără lămpi arse, pete pe imagine sau defecte majore).
 
-Dacă specificațiile tehnice complete nu sunt scrise explicit în descriere, folosește-ți cunoștințele tehnice despre modelul identificat pentru a verifica fișa tehnică a producătorului.
+Dacă specificațiile tehnice complete nu sunt scrise explicit în descriere, folosește-ți cunoștințele tehnice despre modelul identificat pentru a verifica specificațiile oficiale.
 
 Trebuie să returnezi UNICEMENTE un obiect JSON cu această structură:
 {
@@ -48,7 +41,7 @@ Trebuie să returnezi UNICEMENTE un obiect JSON cu această structură:
   "reject_reason": "Motivul respingerii (dacă eligible este false)",
   "brand_model": "Nume Brand și Model identificat",
   "specs": "Rezoluție nativă | Lumeni ANSI | Aspect | An lansare",
-  "quality_score": "X/10 - O scurtă argumentare privind raportul calitate/preț în raport cu piața second-hand",
+  "quality_score": "X/10 - O scurtă argumentare privind raportul calitate/preț în raport cu piața",
   "summary": "Scurtă descriere a stării și dotărilor din anunț"
 }
 """
@@ -95,55 +88,61 @@ def get_already_inserted_links(worksheet):
         return set()
 
 def fetch_olx_ads():
-    """Preluare anunțuri prin API-ul intern JSON OLX."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    """Preluare anunțuri folosind curl_cffi cu amprentă completă de Chrome."""
+    session = requests.Session(impersonate="chrome124")
     
-    # Efectuăm o cerere către homepage pentru a prelua cookie-urile de sesiune
-    try:
-        session.get("https://www.olx.ro", timeout=10)
-    except Exception:
-        pass
+    # 1. Încărcare primară pentru stabilire sesiune
+    session.get("https://www.olx.ro")
+    time.sleep(1)
     
-    response = session.get(OLX_API_URL, timeout=15)
+    # 2. Cerere către pagina de categorie
+    response = session.get(OLX_SEARCH_URL)
     response.raise_for_status()
-    data = response.json()
     
-    offers = data.get("data", [])
+    soup = BeautifulSoup(response.text, "html.parser")
+    cards = soup.find_all("div", {"data-testid": "l-card"})
+    
     ads = []
-    
-    for offer in offers:
-        title = offer.get("title", "")
-        url = offer.get("url", "")
+    for card in cards:
+        title_elem = card.find("h6")
+        link_elem = card.find("a")
+        price_elem = card.find("p", {"data-testid": "ad-price"})
         
-        # Formatare preț
-        params = offer.get("params", [])
-        price_str = "Nespecificat"
-        for p in params:
-            if p.get("key") == "price":
-                val = p.get("value", {})
-                price_str = f"{val.get('value', '')} {val.get('currency', 'RON')}"
-                break
-                
-        desc = offer.get("description", "")
-        # Eliminare tag-uri html simple din descriere
-        desc_clean = desc.replace("<br />", "\n").replace("<br/>", "\n").replace("<p>", "").replace("</p>", "\n")
+        if not title_elem or not link_elem:
+            continue
+            
+        title = title_elem.get_text(strip=True)
+        raw_href = link_elem.get("href", "")
+        link = raw_href if raw_href.startswith("http") else f"https://www.olx.ro{raw_href}"
+        price = price_elem.get_text(strip=True) if price_elem else "Nespecificat"
         
         ads.append({
             "title": title,
-            "link": url,
-            "price": price_str,
-            "description": desc_clean
+            "link": link,
+            "price": price
         })
         
     return ads
 
+def fetch_ad_description(session, ad_url):
+    """Preluare descriere anunț individual."""
+    try:
+        res = session.get(ad_url)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            desc_div = soup.find("div", {"data-cy": "ad_description"})
+            if desc_div:
+                return desc_div.get_text(separator="\n", strip=True)
+    except Exception as e:
+        print(f"Eroare descriere {ad_url}: {e}")
+    return ""
+
 def analyze_ad_with_gemini(client, title, price, description):
-    """Analizează anunțul cu Gemini API folosind JSON structurat."""
+    """Analiză anunț prin Gemini API."""
     prompt = f"""
     Titlu Anunț: {title}
     Preț solicitat: {price}
-    Descriere din anunț:
+    Descriere completă din anunț:
     {description}
     """
     
@@ -169,8 +168,9 @@ def main():
     worksheet = init_google_sheets()
     inserted_links = get_already_inserted_links(worksheet)
     
+    session = requests.Session(impersonate="chrome124")
     ads = fetch_olx_ads()
-    print(f"S-au recepționat {len(ads)} anunțuri de pe OLX.")
+    print(f"S-au găsit {len(ads)} anunțuri pe OLX.")
     
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     inserted_count = 0
@@ -180,11 +180,13 @@ def main():
             continue
             
         print(f"\nAnalizare: {ad['title']} ({ad['price']})")
+        description = fetch_ad_description(session, ad["link"])
+        
         analysis = analyze_ad_with_gemini(
             client=gemini_client,
             title=ad["title"],
             price=ad["price"],
-            description=ad["description"]
+            description=description
         )
         
         if not analysis:
@@ -209,9 +211,9 @@ def main():
             reason = analysis.get("reject_reason", "Neeligibil")
             print(f" -> Respins: {reason}")
             
-        time.sleep(1)  # Pauză scurtă între interogări
+        time.sleep(1)
 
-    print(f"\nFinalizat cu succes! S-au adăugat {inserted_count} anunțuri noi eligibile.")
+    print(f"\nFinalizat cu succes! S-au adăugat {inserted_count} anunțuri conforme.")
 
 if __name__ == "__main__":
     main()
