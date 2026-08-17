@@ -105,7 +105,7 @@ def analyze_ad_with_gemini(client, title, price, description):
     prompt = f"Titlu: {title}\nPreț: {price}\nDescriere:\n{description}"
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.0-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
