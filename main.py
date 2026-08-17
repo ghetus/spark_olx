@@ -104,8 +104,8 @@ def fetch_olx_ads_api(session):
 def analyze_ad_with_gemini(client, title, price, description):
     prompt = f"Titlu: {title}\nPreț: {price}\nDescriere:\n{description}"
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
+       response = client.models.generate_content(
+            model="gemini-2.0-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
@@ -113,7 +113,7 @@ def analyze_ad_with_gemini(client, title, price, description):
                 temperature=0.2,
             ),
         )
-        return json.loads(response.text)
+  return json.loads(response.text)
     except Exception as e:
         print(f"Eroare Gemini: {e}")
         return None
