@@ -14,7 +14,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "Proiectoare OLX")
 
-# Folosim API-ul intern OLX - mult mai rapid și imun la modificările de design web
 OLX_API_URL = "https://www.olx.ro/api/v1/offers/?query=videoproiector&sort_by=created_at:desc&limit=40"
 
 SYSTEM_INSTRUCTION = """
@@ -80,7 +79,6 @@ def fetch_olx_ads_api(session):
         title = offer.get("title", "")
         url = offer.get("url", "")
         
-        # Extragere preț din structura JSON
         price_str = "Nespecificat"
         for param in offer.get("params", []):
             if param.get("key") == "price":
@@ -88,7 +86,6 @@ def fetch_olx_ads_api(session):
                 price_str = f"{val.get('value', '')} {val.get('currency', 'RON')}"
                 break
                 
-        # API-ul ne dă direct și descrierea! Curățăm tag-urile de HTML.
         raw_desc = offer.get("description", "")
         clean_desc = raw_desc.replace("<br />", "\n").replace("<br/>", "\n").replace("<p>", "").replace("</p>", "\n")
         
@@ -104,7 +101,7 @@ def fetch_olx_ads_api(session):
 def analyze_ad_with_gemini(client, title, price, description):
     prompt = f"Titlu: {title}\nPreț: {price}\nDescriere:\n{description}"
     try:
-       response = client.models.generate_content(
+        response = client.models.generate_content(
             model="gemini-2.0-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -113,7 +110,7 @@ def analyze_ad_with_gemini(client, title, price, description):
                 temperature=0.2,
             ),
         )
-  return json.loads(response.text)
+        return json.loads(response.text)
     except Exception as e:
         print(f"Eroare Gemini: {e}")
         return None
@@ -124,7 +121,6 @@ def main():
     gemini_client = init_gemini()
     worksheet = init_google_sheets()
     
-    # Preluăm linkurile deja procesate
     try:
         inserted_links = set(worksheet.col_values(8)[1:])
     except Exception:
@@ -171,7 +167,7 @@ def main():
             reason = analysis.get("reject_reason", "Neeligibil")
             print(f" -> Respins: {reason}")
             
-        time.sleep(1) # Pauză pentru a nu copleși API-ul Gemini
+        time.sleep(1)
 
     print(f"\nFinalizat! Au fost adăugate {inserted_count} anunțuri noi conforme.")
 
