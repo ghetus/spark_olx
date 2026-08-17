@@ -1,4 +1,4 @@
 google-genai
 gspread
-requests
+curl_cffi
 beautifulsoup4
