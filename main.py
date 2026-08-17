@@ -15,7 +15,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "Proiectoare OLX")
 
-OLX_SEARCH_URL = "https://www.olx.ro/d/electronice-electrocasnice/tv-audio-video/videoproiectoare/?search%5Border%5D=created_at%3Adesc"
+OLX_SEARCH_URL = "https://www.olx.ro/oferte/q-videoproiector/?search%5Border%5D=created_at%3Adesc"
 
 SYSTEM_INSTRUCTION = """
 Ești un expert tehnic în echipamente video și videoproiectoare. 
